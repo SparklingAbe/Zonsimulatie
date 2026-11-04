@@ -33,6 +33,7 @@ TEMPLATE_FILE = "tmy3_sample.csv"
 
 DEFAULT_YEAR = 2025
 
+# KNMI-uurgegevens worden als UTC verwerkt.
 TZ = "UTC"
 
 REQUEST_TIMEOUT = 120
@@ -40,13 +41,13 @@ REQUEST_TIMEOUT = 120
 MAIN_VARIABLES = "Q:T"
 WIND_VARIABLES = "FH:FF"
 
-# Minimaal aandeel geldige waarden in de testperiode
+# Minimaal aandeel geldige waarden in de testperiode.
 MIN_VALID_RATIO = 0.95
 
-# Maximaal aantal stations dat automatisch wordt getest
+# Maximaal aantal stations dat automatisch wordt getest.
 MAX_STATIONS_TO_TEST = 30
 
-# Testperiode om te bepalen of variabelen beschikbaar zijn
+# Testperiode om te bepalen of variabelen beschikbaar zijn.
 TEST_MONTH = 6
 TEST_DAYS = 14
 
@@ -190,7 +191,7 @@ def select_location_on_map():
         pady=10,
     )
 
-    # Midden van Nederland
+    # Midden van Nederland.
     map_widget.set_position(
         52.1326,
         5.2913,
@@ -234,8 +235,6 @@ def select_location_on_map():
             return
 
         selection["confirmed"] = True
-
-        # Eerst mainloop verlaten, daarna pas vernietigen
         root.quit()
 
     def cancel_location():
@@ -283,7 +282,7 @@ def select_location_on_map():
 
     root.mainloop()
 
-    # Openstaande after-callbacks van tkintermapview annuleren
+    # Openstaande callbacks van tkintermapview annuleren.
     try:
         after_ids = root.tk.call(
             "after",
@@ -345,8 +344,6 @@ def load_station_list():
             f"Stationsbestand niet gevonden:\n{path}"
         )
 
-    # De KNMI-lijst is komma-gescheiden.
-    # Eerst alles als tekst lezen.
     stations = pd.read_csv(
         path,
         sep=",",
@@ -1493,12 +1490,14 @@ def ask_inputs():
 
     print()
     print("Definitieve stationkeuze:")
+
     print(
         f"Zon/temperatuur: "
         f"{int(main_primary['STN'])} - "
         f"{main_primary['LOCATIE']} "
         f"({float(main_primary['AFSTAND_KM']):.1f} km)"
     )
+
     print(
         f"Wind          : "
         f"{int(wind_primary['STN'])} - "
@@ -1548,6 +1547,11 @@ def ask_inputs():
 def prepare_main_station(dataframe):
     """
     Converteert Q naar GHI en T naar DryBulb.
+
+    KNMI Q is globale straling in J/cm² gedurende het uurvak.
+    De conversie naar W/m² wordt:
+
+        Q * 10.000 / 3.600
     """
 
     result = dataframe.copy()
@@ -1654,13 +1658,27 @@ def merge_main_and_wind(
 
 
 # ============================================================
-# TIJDINDEX
+# TIJDINDEXEN
 # ============================================================
 
 def build_times(dataframe):
     """
-    KNMI HH is het einde van het uurvak.
-    De zonnestand wordt op het midden van het uurvak berekend.
+    Maakt twee tijdassen uit KNMI-uurgegevens.
+
+    KNMI HH is het einde van het uurvak:
+
+        HH=1  -> 00:00 tot 01:00
+        HH=2  -> 01:00 tot 02:00
+        ...
+        HH=24 -> 23:00 tot 24:00
+
+    midpoint_times:
+        Midden van ieder uurvak.
+        Wordt gebruikt voor de zonnepositie en Erbs-decompositie.
+
+    hour_beginning_times:
+        Begin van ieder uurvak.
+        Wordt geschreven naar het HelioScope TMY3-bestand.
     """
 
     dates = (
@@ -1685,6 +1703,7 @@ def build_times(dataframe):
         errors="raise",
     )
 
+    # Tijdstip aan het einde van ieder KNMI-uurvak.
     end_times = (
         base
         + pd.to_timedelta(
@@ -1693,27 +1712,47 @@ def build_times(dataframe):
         )
     )
 
-    midpoint = (
+    # Representatief tijdstip voor zonnepositie.
+    midpoint_times = (
         end_times
         - pd.Timedelta(minutes=30)
     )
 
-    return pd.DatetimeIndex(
-        midpoint
+    # Tijdstip dat het begin van het uurvak aangeeft.
+    hour_beginning_times = (
+        end_times
+        - pd.Timedelta(hours=1)
+    )
+
+    midpoint_times = pd.DatetimeIndex(
+        midpoint_times
     ).tz_convert(TZ)
+
+    hour_beginning_times = pd.DatetimeIndex(
+        hour_beginning_times
+    ).tz_convert(TZ)
+
+    return (
+        midpoint_times,
+        hour_beginning_times,
+    )
 
 
 def remove_february_29(
     dataframe,
-    times,
+    midpoint_times,
+    hour_beginning_times,
 ):
     """
-    Verwijdert 29 februari voor een bestand van 8760 uur.
+    Verwijdert alle uurvakken van 29 februari.
+
+    Het filter gebruikt hour_beginning_times, omdat die tijdas
+    bepaalt bij welke kalenderdag het uurvak hoort.
     """
 
     february_29 = (
-        (times.month == 2)
-        & (times.day == 29)
+        (hour_beginning_times.month == 2)
+        & (hour_beginning_times.day == 29)
     )
 
     number_removed = int(
@@ -1731,9 +1770,108 @@ def remove_february_29(
             .reset_index(drop=True)
         )
 
-        times = times[~february_29]
+        midpoint_times = (
+            midpoint_times[~february_29]
+        )
 
-    return dataframe, times
+        hour_beginning_times = (
+            hour_beginning_times[~february_29]
+        )
+
+    return (
+        dataframe,
+        midpoint_times,
+        hour_beginning_times,
+    )
+
+
+def validate_time_axes(
+    midpoint_times,
+    hour_beginning_times,
+    expected_year,
+):
+    """
+    Controleert dat beide tijdassen volledig en correct uitgelijnd zijn.
+    """
+
+    if len(midpoint_times) != 8760:
+        raise ValueError(
+            "Midpoint-tijdas bevat "
+            f"{len(midpoint_times)} waarden; verwacht 8760."
+        )
+
+    if len(hour_beginning_times) != 8760:
+        raise ValueError(
+            "Hour-beginning-tijdas bevat "
+            f"{len(hour_beginning_times)} waarden; verwacht 8760."
+        )
+
+    if hour_beginning_times.has_duplicates:
+        raise ValueError(
+            "Hour-beginning-tijdas bevat dubbele tijdstippen."
+        )
+
+    if midpoint_times.has_duplicates:
+        raise ValueError(
+            "Midpoint-tijdas bevat dubbele tijdstippen."
+        )
+
+    offsets = (
+        midpoint_times
+        - hour_beginning_times
+    )
+
+    expected_offset = pd.Timedelta(
+        minutes=30
+    )
+
+    if not all(
+        offset == expected_offset
+        for offset in offsets
+    ):
+        raise ValueError(
+            "Niet ieder midpoint ligt precies 30 minuten "
+            "na het begin van het uurvak."
+        )
+
+    if not (
+        hour_beginning_times.year
+        == expected_year
+    ).all():
+        raise ValueError(
+            "De hour-beginning-tijdas bevat waarden "
+            f"buiten {expected_year}."
+        )
+
+    expected_first = pd.Timestamp(
+        year=expected_year,
+        month=1,
+        day=1,
+        hour=0,
+        tz=TZ,
+    )
+
+    expected_last = pd.Timestamp(
+        year=expected_year,
+        month=12,
+        day=31,
+        hour=23,
+        tz=TZ,
+    )
+
+    if hour_beginning_times[0] != expected_first:
+        raise ValueError(
+            "Eerste uurvak is niet "
+            f"{expected_first} maar "
+            f"{hour_beginning_times[0]}."
+        )
+
+    if hour_beginning_times[-1] != expected_last:
+        raise ValueError(
+            "Laatste uurvak is niet "
+            f"{expected_last} maar "
+            f"{hour_beginning_times[-1]}."
+        )
 
 
 # ============================================================
@@ -1748,6 +1886,8 @@ def add_dni_dhi(
 ):
     """
     Leidt DNI en DHI af met het pvlib Erbs-model.
+
+    times moet de midpoint-tijdas zijn.
     """
 
     location = pvlib.location.Location(
@@ -1806,7 +1946,7 @@ def add_dni_dhi(
 
 def validate_physical_data(dataframe):
     """
-    Controleert de kolommen voordat de TMY3 wordt geschreven.
+    Controleert de fysieke kolommen voordat de TMY3 wordt geschreven.
     """
 
     if len(dataframe) != 8760:
@@ -1861,6 +2001,26 @@ def validate_physical_data(dataframe):
             raise ValueError(
                 f"{column} bevat nog 77777."
             )
+
+    if (dataframe["GHI"] < 0).any():
+        raise ValueError(
+            "GHI bevat negatieve waarden."
+        )
+
+    if (dataframe["DNI"] < 0).any():
+        raise ValueError(
+            "DNI bevat negatieve waarden."
+        )
+
+    if (dataframe["DHI"] < 0).any():
+        raise ValueError(
+            "DHI bevat negatieve waarden."
+        )
+
+    if (dataframe["Wspd"] < 0).any():
+        raise ValueError(
+            "Windsnelheid bevat negatieve waarden."
+        )
 
 
 # ============================================================
@@ -1984,9 +2144,12 @@ def save_template(
 # UITVOER VALIDEREN
 # ============================================================
 
-def validate_output_file(output_path):
+def validate_output_file(
+    output_path,
+    expected_year,
+):
     """
-    Leest de geschreven CSV opnieuw in.
+    Leest de geschreven CSV opnieuw in en controleert de uitvoer.
     """
 
     dataframe = pd.read_csv(
@@ -1997,7 +2160,7 @@ def validate_output_file(output_path):
     if len(dataframe) != 8760:
         raise ValueError(
             f"Geschreven bestand bevat "
-            f"{len(dataframe)} regels."
+            f"{len(dataframe)} regels; verwacht 8760."
         )
 
     required_columns = [
@@ -2031,6 +2194,71 @@ def validate_output_file(output_path):
     if duplicate_times.any():
         raise ValueError(
             "Uitvoer bevat dubbele tijdstippen."
+        )
+
+    output_times = pd.to_datetime(
+        dataframe["Date (MM/DD/YYYY)"].astype(str)
+        + " "
+        + dataframe["Time (HH:MM)"].astype(str),
+        format="%m/%d/%Y %H:%M",
+        errors="raise",
+    )
+
+    expected_first = pd.Timestamp(
+        year=expected_year,
+        month=1,
+        day=1,
+        hour=0,
+    )
+
+    expected_last = pd.Timestamp(
+        year=expected_year,
+        month=12,
+        day=31,
+        hour=23,
+    )
+
+    if output_times.iloc[0] != expected_first:
+        raise ValueError(
+            "Eerste tijdstip in de uitvoer is niet "
+            f"{expected_first}, maar {output_times.iloc[0]}."
+        )
+
+    if output_times.iloc[-1] != expected_last:
+        raise ValueError(
+            "Laatste tijdstip in de uitvoer is niet "
+            f"{expected_last}, maar {output_times.iloc[-1]}."
+        )
+
+    time_differences = output_times.diff().dropna()
+
+    # Bij een schrikkeljaar is er na het verwijderen van 29 februari
+    # één sprong van 25 uur. Alle andere stappen moeten één uur zijn.
+    allowed_differences = {
+        pd.Timedelta(hours=1),
+        pd.Timedelta(hours=25),
+    }
+
+    invalid_differences = (
+        ~time_differences.isin(
+            allowed_differences
+        )
+    )
+
+    if invalid_differences.any():
+        invalid_rows = dataframe.loc[
+            invalid_differences[
+                invalid_differences
+            ].index,
+            [
+                "Date (MM/DD/YYYY)",
+                "Time (HH:MM)",
+            ],
+        ].head(10)
+
+        raise ValueError(
+            "Uitvoer bevat onverwachte tijdsprongen.\n"
+            f"{invalid_rows.to_string(index=False)}"
         )
 
 
@@ -2071,37 +2299,39 @@ def main():
 
     print()
     print("Definitieve instellingen:")
-    print(f"Project       : {project_name}")
-    print(f"Jaar          : {year}")
+    print(f"Project         : {project_name}")
+    print(f"Jaar            : {year}")
 
     print(
-        f"Zon/temperatuur: "
+        f"Zon/temperatuur : "
         f"{main_station} - "
         f"{settings['main_station_name']} "
         f"({settings['main_distance_km']:.1f} km)"
     )
 
     print(
-        f"Back-up zon   : "
+        f"Back-up zon     : "
         f"{settings['main_backup_station']}"
     )
 
     print(
-        f"Wind          : "
+        f"Wind            : "
         f"{wind_station} - "
         f"{settings['wind_station_name']} "
         f"({settings['wind_distance_km']:.1f} km)"
     )
 
     print(
-        f"Back-up wind  : "
+        f"Back-up wind    : "
         f"{settings['wind_backup_station']}"
     )
 
     print(
-        f"Projectlocatie: "
+        f"Projectlocatie  : "
         f"{latitude:.6f}, {longitude:.6f}"
     )
+
+    print(f"Tijdzone        : {TZ}")
 
     print()
     print(
@@ -2171,14 +2401,19 @@ def main():
         wind_data,
     )
 
-    print("6) Tijdindex maken...")
+    print("6) Tijdindexen maken...")
 
-    times = build_times(
+    (
+        midpoint_times,
+        hour_beginning_times,
+    ) = build_times(
         physical
     )
 
+    # Het kalenderjaar wordt bepaald op basis van het begin
+    # van het uurvak.
     year_mask = (
-        times.year == year
+        hour_beginning_times.year == year
     )
 
     physical = (
@@ -2186,15 +2421,55 @@ def main():
         .reset_index(drop=True)
     )
 
-    times = times[year_mask]
+    midpoint_times = (
+        midpoint_times[year_mask]
+    )
 
-    physical, times = remove_february_29(
+    hour_beginning_times = (
+        hour_beginning_times[year_mask]
+    )
+
+    (
         physical,
-        times,
+        midpoint_times,
+        hour_beginning_times,
+    ) = remove_february_29(
+        physical,
+        midpoint_times,
+        hour_beginning_times,
     )
 
     print(
         f"   Aantal regels: {len(physical)}"
+    )
+
+    print()
+    print("   Controle tijdassen:")
+
+    print(
+        f"   Eerste HelioScope-uur : "
+        f"{hour_beginning_times[0]}"
+    )
+
+    print(
+        f"   Eerste midpoint       : "
+        f"{midpoint_times[0]}"
+    )
+
+    print(
+        f"   Laatste HelioScope-uur: "
+        f"{hour_beginning_times[-1]}"
+    )
+
+    print(
+        f"   Laatste midpoint      : "
+        f"{midpoint_times[-1]}"
+    )
+
+    validate_time_axes(
+        midpoint_times=midpoint_times,
+        hour_beginning_times=hour_beginning_times,
+        expected_year=year,
     )
 
     print("7) DNI en DHI berekenen...")
@@ -2203,7 +2478,7 @@ def main():
         ghi=physical[
             "GHI"
         ].to_numpy(dtype=float),
-        times=times,
+        times=midpoint_times,
         latitude=latitude,
         longitude=longitude,
     )
@@ -2230,14 +2505,15 @@ def main():
 
     print("10) Template vullen...")
 
+    # De TMY3-uitvoer gebruikt het begin van ieder uurvak.
     template["Date (MM/DD/YYYY)"] = [
         timestamp.strftime("%m/%d/%Y")
-        for timestamp in times
+        for timestamp in hour_beginning_times
     ]
 
     template["Time (HH:MM)"] = [
         timestamp.strftime("%H:%M")
-        for timestamp in times
+        for timestamp in hour_beginning_times
     ]
 
     template["GHI (W/m^2)"] = (
@@ -2268,6 +2544,7 @@ def main():
         1,
     )
 
+    # UTC-offset 0.0 hoort bij TZ = "UTC".
     metadata_line = ",".join(
         [
             str(main_station),
@@ -2292,13 +2569,35 @@ def main():
     print("12) Geschreven bestand controleren...")
 
     validate_output_file(
-        output_path
+        output_path=output_path,
+        expected_year=year,
     )
 
     print()
     print("Gereed.")
     print(f"Bestand: {output_path}")
     print(f"Aantal uurregels: {len(template)}")
+
+    print(
+        "Eerste uitvoertijd:",
+        template.iloc[0][
+            "Date (MM/DD/YYYY)"
+        ],
+        template.iloc[0][
+            "Time (HH:MM)"
+        ],
+    )
+
+    print(
+        "Laatste uitvoertijd:",
+        template.iloc[-1][
+            "Date (MM/DD/YYYY)"
+        ],
+        template.iloc[-1][
+            "Time (HH:MM)"
+        ],
+    )
+
     print(
         "Lege windsnelheden:",
         int(

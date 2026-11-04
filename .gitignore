@@ -435,7 +435,7 @@ CSV output/
 OUD/
 build/
 dist/
-
+_internal/
 #PDF files
 .pdf
 .spec

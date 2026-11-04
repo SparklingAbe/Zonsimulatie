@@ -433,7 +433,9 @@ FodyWeavers.xsd
 KNMI data/
 CSV output/
 OUD/
+build/
+dist/
 
 #PDF files
 .pdf
-
+.spec
